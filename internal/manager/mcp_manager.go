@@ -83,8 +83,16 @@ func (m *MCPServerManager) createServerFromConfig(service models.MCPService) (*m
 		toolDef := mcp.Tool{
 			Name:        tool.Name,
 			Description: tool.Description,
-			// TODO: 需要将 JSONB 转换为 *jsonschema.Schema
-			// InputSchema: tool.ArgsSchema,
+		}
+
+		// 转换 JSONB 到 JSON Schema
+		if tool.ArgsSchema != nil {
+			schema, err := tool.ArgsSchema.ToJSONSchema()
+			if err != nil {
+				log.Printf("Warning: Failed to convert args schema for tool %s: %v", tool.Name, err)
+			} else if schema != nil {
+				toolDef.InputSchema = schema
+			}
 		}
 
 		// 创建符合 ToolHandlerFor 类型的处理器

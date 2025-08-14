@@ -2,34 +2,45 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 
+	"McpServer/internal/config"
 	"McpServer/internal/database"
 	"McpServer/internal/handlers"
 	"McpServer/internal/manager"
 )
 
 var (
-	host = flag.String("host", "0.0.0.0", "host to listen on")
-	port = flag.String("port", "9001", "port to listen on")
+	configPath = flag.String("config", "config/config.dev.yaml", "path to config file")
 )
 
 func main() {
 	flag.Parse()
 
+	// 加载配置
+	cfg, err := config.LoadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// 从环境变量覆盖配置
+	config.LoadConfigFromEnv(cfg)
+
+	log.Printf("Starting MCP Server with config: %s:%d", cfg.Server.Host, cfg.Server.Port)
+
 	// 创建数据库服务
-	db, err := database.NewDatabaseService()
+	db, err := database.NewDatabaseService(&cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to create database service: %v", err)
 	}
 	defer db.Close()
 
 	// 创建处理器注册表
-	handlerRegistry := handlers.NewToolHandlerRegistry()
+	dbAdapter := handlers.NewDatabaseAdapter(db)
+	handlerRegistry := handlers.NewToolHandlerRegistry(dbAdapter)
 
-		// 创建 MCP 服务器管理器
+	// 创建 MCP 服务器管理器
 	mcpManager := manager.NewMCPServerManager(db, handlerRegistry)
 
 	// 从数据库加载服务器配置
@@ -61,7 +72,7 @@ func main() {
 	mux.Handle("/messages/", http.HandlerFunc(httpHandler))
 	mux.Handle("/message", http.HandlerFunc(httpHandler))
 
-	addr := fmt.Sprintf("%s:%s", *host, *port)
+	addr := cfg.Server.GetServerAddr()
 	log.Printf("Server starting on %s", addr)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {

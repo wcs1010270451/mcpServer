@@ -17,6 +17,8 @@ type DatabaseServiceInterface interface {
 	GetSSEServiceConfig(serverID string) (*models.MCPServiceSSE, error)
 	IsRemoteStdioService(serverID string) (bool, error)
 	IsRemoteSSEService(serverID string) (bool, error)
+	GetEmployeeByName(name string) (*models.Employee, error)
+	GetAllEmployees() ([]models.Employee, error)
 }
 
 // HandlerRegistryInterface 处理器注册表接口

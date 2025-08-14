@@ -1,0 +1,43 @@
+# MCP Server Configuration
+
+# 服务器配置
+server:
+  host: "0.0.0.0"
+  port: 9001
+  
+# 数据库配置
+database:
+  host: "127.0.0.1"
+  port: 9002
+  username: "wcs"
+  password: "123"
+  database: "mcp_proxy"
+  sslmode: "disable"
+  max_open_conns: 25
+  max_idle_conns: 10
+  conn_max_lifetime: "5m"
+
+# 日志配置
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json" # json, text
+  file: ""       # 留空则输出到控制台
+
+# 远程服务配置
+remote:
+  # 默认超时设置
+  default_timeout: "30s"
+  default_connect_timeout: "10s"
+  default_retry_attempts: 3
+  default_retry_delay: "3s"
+  
+  # 会话管理
+  session_cleanup_interval: "30s"
+  default_idle_ttl: "5m"
+
+# 工具配置
+tools:
+  # 内置工具启用状态
+  builtin_echo: true
+  builtin_greet: true
+  builtin_status: true

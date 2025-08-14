@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"McpServer/internal/models"
+
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
@@ -16,32 +18,36 @@ type DatabaseService struct {
 	db *sql.DB
 }
 
+// DatabaseConfig 数据库配置接口
+type DatabaseConfig interface {
+	GetDSN() string
+	GetMaxOpenConns() int
+	GetMaxIdleConns() int
+	GetConnMaxLifetime() time.Duration
+}
+
 // NewDatabaseService 创建新的数据库服务
-func NewDatabaseService() (*DatabaseService, error) {
-	// 从环境变量获取数据库连接信息
-	dbHost := getEnvOrDefault("DB_HOST", "8.145.50.91")
-	//dbHost := getEnvOrDefault("DB_HOST", "127.0.0.1")
-	dbPort := getEnvOrDefault("DB_PORT", "9002")
-	dbUser := getEnvOrDefault("DB_USER", "wcs")
-	dbPassword := getEnvOrDefault("DB_PASSWORD", "123")
-	dbName := getEnvOrDefault("DB_NAME", "mcp_proxy")
-	sslMode := getEnvOrDefault("DB_SSLMODE", "disable")
+func NewDatabaseService(config DatabaseConfig) (*DatabaseService, error) {
+	// 使用配置中的连接字符串
+	connStr := config.GetDSN()
 
-	// 构建连接字符串
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
-
+	// 连接数据库
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// 设置连接池参数
+	db.SetMaxOpenConns(config.GetMaxOpenConns())
+	db.SetMaxIdleConns(config.GetMaxIdleConns())
+	db.SetConnMaxLifetime(config.GetConnMaxLifetime())
 
 	// 测试连接
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	log.Printf("Database connected successfully to %s:%s/%s", dbHost, dbPort, dbName)
+	log.Printf("Successfully connected to database")
 
 	return &DatabaseService{db: db}, nil
 }
@@ -57,7 +63,7 @@ func (ds *DatabaseService) GetEnabledServices() ([]models.MCPService, error) {
 		SELECT server_id, display_name, implementation_name, protocol_version, 
 		       enabled, metadata, created_at, updated_at, adapter, start_mode
 		FROM mcp_service 
-		WHERE enabled = true AND adapter NOT IN ('remote_stdio', 'remote_sse')
+		WHERE enabled = true AND adapter = 'builtin'
 		ORDER BY server_id
 	`
 
@@ -299,6 +305,71 @@ func (ds *DatabaseService) IsRemoteSSEService(serverID string) (bool, error) {
 	}
 
 	return exists, nil
+}
+
+// GetEmployeeByName 根据姓名查询员工信息
+func (ds *DatabaseService) GetEmployeeByName(name string) (*models.Employee, error) {
+	query := `
+		SELECT id, name, address, phone, enabled
+		FROM employees 
+		WHERE name = $1 AND enabled = true
+	`
+
+	var employee models.Employee
+	err := ds.db.QueryRow(query, name).Scan(
+		&employee.ID,
+		&employee.Name,
+		&employee.Address,
+		&employee.Phone,
+		&employee.Enabled,
+	)
+
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil // 未找到员工
+		}
+		return nil, fmt.Errorf("failed to query employee by name: %v", err)
+	}
+
+	return &employee, nil
+}
+
+// GetAllEmployees 获取所有启用的员工列表
+func (ds *DatabaseService) GetAllEmployees() ([]models.Employee, error) {
+	query := `
+		SELECT id, name, address, phone, enabled
+		FROM employees 
+		WHERE enabled = true
+		ORDER BY name
+	`
+
+	rows, err := ds.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query employees: %v", err)
+	}
+	defer rows.Close()
+
+	var employees []models.Employee
+	for rows.Next() {
+		var employee models.Employee
+		err := rows.Scan(
+			&employee.ID,
+			&employee.Name,
+			&employee.Address,
+			&employee.Phone,
+			&employee.Enabled,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan employee row: %v", err)
+		}
+		employees = append(employees, employee)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating employee rows: %v", err)
+	}
+
+	return employees, nil
 }
 
 // getEnvOrDefault 获取环境变量，如果不存在则返回默认值
