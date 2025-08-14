@@ -100,17 +100,25 @@ func (sm *SessionManager) HandleInitialConnection(w http.ResponseWriter, r *http
 func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handling session request: %s %s", r.Method, r.URL.String())
 
-	// 检查是否是 POST 到 /message 或 /messages 端点
+	// 检查是否是 POST 到 /message 或 /messages 端点，或者其他带 sessionId/session_id/sessionid 的请求
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("session_id")
+	}
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionid") // 支持小写的 sessionid
+	}
+
+	if sessionID != "" {
+		log.Printf("Detected request to %s with sessionId: %s", r.URL.Path, sessionID)
+		sm.handleSessionMessage(w, r, sessionID)
+		return
+	}
+
+	// 检查是否是 POST 到 /message 或 /messages 端点（无 sessionId 参数的情况）
 	if r.Method == "POST" && (strings.HasPrefix(r.URL.Path, "/message") || strings.HasPrefix(r.URL.Path, "/messages")) {
-		sessionID := r.URL.Query().Get("sessionId")
-		if sessionID == "" {
-			sessionID = r.URL.Query().Get("session_id")
-		}
-		if sessionID != "" {
-			log.Printf("Detected POST request to %s with sessionId: %s", r.URL.Path, sessionID)
-			sm.handleSessionMessage(w, r, sessionID)
-			return
-		}
+		log.Printf("POST request to %s without sessionId, checking request body", r.URL.Path)
+		// 可能需要从请求体中提取 sessionId，但这里先使用现有逻辑
 	}
 
 	// 遍历所有已缓存的处理器，让它们尝试处理这个请求
@@ -136,10 +144,34 @@ func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 如果有多个处理器，我们需要更智能的路由策略
-	// 这里简化处理：使用第一个可用的处理器
-	log.Printf("Multiple handlers available (%d), using first one: %s", len(handlers), serverIDs[0])
-	handlers[0].ServeHTTP(w, r)
+	// 如果有多个处理器，尝试从 URL 路径或其他信息推断目标服务器
+	// 查看是否有服务器 ID 的线索
+	var targetHandler http.Handler
+	var targetServerID string
+
+	// 尝试从 URL 路径中推断目标服务器
+	for i, serverID := range serverIDs {
+		if strings.Contains(r.URL.String(), serverID) {
+			targetHandler = handlers[i]
+			targetServerID = serverID
+			log.Printf("Inferred target server from URL: %s", serverID)
+			break
+		}
+	}
+
+	// 如果无法推断，记录警告并拒绝请求
+	if targetHandler == nil {
+		log.Printf("Multiple handlers available (%d): %v, but cannot determine target server",
+			len(handlers), serverIDs)
+		log.Printf("Request URL: %s", r.URL.String())
+		log.Printf("Please specify sessionId parameter to route to the correct server")
+		http.Error(w, "Cannot determine target server. Multiple active sessions found. Please use sessionId parameter.",
+			http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Using inferred handler for server: %s", targetServerID)
+	targetHandler.ServeHTTP(w, r)
 }
 
 // handleSessionMessage 处理基于 sessionId 的消息请求
@@ -147,6 +179,13 @@ func (sm *SessionManager) handleSessionMessage(w http.ResponseWriter, r *http.Re
 	// 查找会话信息
 	sm.handlerMutex.RLock()
 	sessionInfo, exists := sm.sessions[sessionID]
+
+	// 添加调试信息
+	log.Printf("Looking up sessionId: %s", sessionID)
+	log.Printf("Available sessions: %d", len(sm.sessions))
+	for sid, sinfo := range sm.sessions {
+		log.Printf("  - Session %s -> Server %s", sid, sinfo.ServerID)
+	}
 	sm.handlerMutex.RUnlock()
 
 	if !exists {
@@ -413,7 +452,7 @@ func (sm *SessionManager) handleRemoteSSEProxy(w http.ResponseWriter, r *http.Re
 		}
 
 		// 检查多种可能的 sessionId 格式
-		if strings.Contains(lineStr, "session_id=") || strings.Contains(lineStr, "sessionId=") {
+		if strings.Contains(lineStr, "session_id=") || strings.Contains(lineStr, "sessionId=") || strings.Contains(lineStr, "sessionid=") {
 			var sessionID string
 			var endpointPath string
 
@@ -431,6 +470,21 @@ func (sm *SessionManager) handleRemoteSSEProxy(w http.ResponseWriter, r *http.Re
 				if len(parts) > 1 {
 					sessionID = strings.TrimSpace(parts[1])
 					endpointPath = "/message"
+				}
+			}
+			// 处理 sessionid= 格式（小写）
+			if sessionID == "" && strings.Contains(lineStr, "sessionid=") {
+				parts := strings.Split(lineStr, "sessionid=")
+				if len(parts) > 1 {
+					sessionID = strings.TrimSpace(parts[1])
+					// 尝试推断端点路径
+					if strings.Contains(lineStr, "/messages/") {
+						endpointPath = "/messages/"
+					} else if strings.Contains(lineStr, "/message") {
+						endpointPath = "/message"
+					} else {
+						endpointPath = "/messages/" // 默认
+					}
 				}
 			}
 
