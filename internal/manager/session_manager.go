@@ -3,6 +3,8 @@ package manager
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -18,10 +20,13 @@ import (
 
 // HTTPSessionInfo 存储 HTTP 会话信息
 type HTTPSessionInfo struct {
-	ServerID  string
-	SessionID string
-	Config    *models.MCPServiceSSE
-	LastUsed  time.Time
+	ServerID     string
+	SessionID    string
+	Config       *models.MCPServiceSSE
+	LastUsed     time.Time
+	CreatedAt    time.Time
+	IsActive     bool
+	ConnectionID string // 用于跟踪连接
 }
 
 // SessionManager 管理 MCP 会话
@@ -31,16 +36,137 @@ type SessionManager struct {
 	mcpHandlers  map[string]http.Handler     // serverID -> MCP Handler
 	sessions     map[string]*HTTPSessionInfo // sessionID -> HTTPSessionInfo
 	handlerMutex sync.RWMutex
+
+	// 会话清理配置
+	sessionTimeout time.Duration // 会话超时时间
+	cleanupTicker  *time.Ticker  // 清理定时器
+	shutdownChan   chan bool     // 关闭信号
 }
 
 // NewSessionManager 创建新的会话管理器
 func NewSessionManager(manager MCPServerManagerInterface, db DatabaseServiceInterface) *SessionManager {
-	return &SessionManager{
-		manager:     manager,
-		db:          db,
-		mcpHandlers: make(map[string]http.Handler),
-		sessions:    make(map[string]*HTTPSessionInfo),
+	sm := &SessionManager{
+		manager:        manager,
+		db:             db,
+		mcpHandlers:    make(map[string]http.Handler),
+		sessions:       make(map[string]*HTTPSessionInfo),
+		sessionTimeout: 30 * time.Minute, // 30分钟超时
+		shutdownChan:   make(chan bool),
 	}
+
+	// 启动会话清理协程
+	sm.startSessionCleanup()
+
+	return sm
+}
+
+// startSessionCleanup 启动会话清理协程
+func (sm *SessionManager) startSessionCleanup() {
+	sm.cleanupTicker = time.NewTicker(5 * time.Minute) // 每5分钟清理一次
+
+	go func() {
+		for {
+			select {
+			case <-sm.cleanupTicker.C:
+				sm.cleanupExpiredSessions()
+			case <-sm.shutdownChan:
+				sm.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+
+	log.Printf("Session cleanup started (timeout: %v, interval: 5m)", sm.sessionTimeout)
+}
+
+// cleanupExpiredSessions 清理过期会话
+func (sm *SessionManager) cleanupExpiredSessions() {
+	now := time.Now()
+	expiredSessions := make([]string, 0)
+	expiredServers := make(map[string]bool)
+
+	sm.handlerMutex.Lock()
+
+	// 找出过期的会话
+	for sessionID, sessionInfo := range sm.sessions {
+		if now.Sub(sessionInfo.LastUsed) > sm.sessionTimeout {
+			expiredSessions = append(expiredSessions, sessionID)
+			expiredServers[sessionInfo.ServerID] = true
+		}
+	}
+
+	// 删除过期会话
+	for _, sessionID := range expiredSessions {
+		delete(sm.sessions, sessionID)
+	}
+
+	sm.handlerMutex.Unlock()
+
+	if len(expiredSessions) > 0 {
+		log.Printf("Cleaned up %d expired sessions: %v", len(expiredSessions), expiredSessions)
+
+		// 检查是否有服务器没有活跃会话，清理其处理器
+		sm.cleanupUnusedHandlers(expiredServers)
+	}
+}
+
+// cleanupUnusedHandlers 清理没有活跃会话的处理器
+func (sm *SessionManager) cleanupUnusedHandlers(potentialServers map[string]bool) {
+	sm.handlerMutex.Lock()
+	defer sm.handlerMutex.Unlock()
+
+	// 统计每个服务器的活跃会话数
+	activeServers := make(map[string]int)
+	for _, sessionInfo := range sm.sessions {
+		activeServers[sessionInfo.ServerID]++
+	}
+
+	// 清理没有活跃会话的处理器
+	for serverID := range potentialServers {
+		if activeServers[serverID] == 0 {
+			if _, exists := sm.mcpHandlers[serverID]; exists {
+				delete(sm.mcpHandlers, serverID)
+				log.Printf("Cleaned up handler for inactive server: %s", serverID)
+			}
+		}
+	}
+}
+
+// Shutdown 关闭会话管理器
+func (sm *SessionManager) Shutdown() {
+	close(sm.shutdownChan)
+	if sm.cleanupTicker != nil {
+		sm.cleanupTicker.Stop()
+	}
+	log.Printf("Session manager shutdown")
+}
+
+// GetSessionInfo 获取会话信息（用于调试和监控）
+func (sm *SessionManager) GetSessionInfo() map[string]*HTTPSessionInfo {
+	sm.handlerMutex.RLock()
+	defer sm.handlerMutex.RUnlock()
+
+	// 复制一份以避免并发问题
+	result := make(map[string]*HTTPSessionInfo)
+	for k, v := range sm.sessions {
+		sessionCopy := *v // 复制值
+		result[k] = &sessionCopy
+	}
+	return result
+}
+
+// GetActiveSessionCount 获取活跃会话数量
+func (sm *SessionManager) GetActiveSessionCount() int {
+	sm.handlerMutex.RLock()
+	defer sm.handlerMutex.RUnlock()
+
+	count := 0
+	for _, session := range sm.sessions {
+		if session.IsActive {
+			count++
+		}
+	}
+	return count
 }
 
 // HandleInitialConnection 处理初始连接请求（GET 请求 + server_id）
@@ -84,6 +210,9 @@ func (sm *SessionManager) HandleInitialConnection(w http.ResponseWriter, r *http
 	log.Printf("Creating new MCP SSE handler for server: %s", serverID)
 	mcpHandler := mcp.NewSSEHandler(func(request *http.Request) *mcp.Server {
 		log.Printf("MCP SSE Handler called for server %s, method: %s, URL: %s", serverID, request.Method, request.URL.String())
+
+		// 这里不在 GET 请求时创建 STDIO 会话，而是在后续的 POST 请求中按需创建
+
 		return server
 	})
 
@@ -96,21 +225,78 @@ func (sm *SessionManager) HandleInitialConnection(w http.ResponseWriter, r *http
 	mcpHandler.ServeHTTP(w, r)
 }
 
+// generateSessionID 生成一个新的会话 ID
+func (sm *SessionManager) generateSessionID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return strings.ToUpper(hex.EncodeToString(bytes))
+}
+
+// generateConnectionID 生成连接 ID
+func generateConnectionID() string {
+	bytes := make([]byte, 8)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// createStdioSession 为 STDIO 服务创建虚拟会话
+func (sm *SessionManager) createStdioSession(serverID string, r *http.Request) {
+	// 从 URL 中提取可能的 sessionID，或生成一个新的
+	sessionID := r.URL.Query().Get("sessionid")
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("session_id")
+	}
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+
+	// 如果没有 sessionID，生成一个新的
+	if sessionID == "" {
+		sessionID = sm.generateSessionID()
+		log.Printf("Generated new sessionID for STDIO service %s: %s", serverID, sessionID)
+	}
+
+	log.Printf("Creating STDIO virtual session: %s -> %s", sessionID, serverID)
+
+	// 创建虚拟会话信息
+	now := time.Now()
+	sm.handlerMutex.Lock()
+	sm.sessions[sessionID] = &HTTPSessionInfo{
+		ServerID:     serverID,
+		SessionID:    sessionID,
+		Config:       nil, // STDIO 服务不需要 SSE 配置
+		LastUsed:     now,
+		CreatedAt:    now,
+		IsActive:     true,
+		ConnectionID: generateConnectionID(),
+	}
+	sm.handlerMutex.Unlock()
+
+	log.Printf("Created virtual session for STDIO service: %s (sessionID: %s)", serverID, sessionID)
+}
+
 // HandleSessionRequest 处理会话请求（POST 请求或无 server_id 的请求）
 func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handling session request: %s %s", r.Method, r.URL.String())
 
 	// 检查是否是 POST 到 /message 或 /messages 端点，或者其他带 sessionId/session_id/sessionid 的请求
 	sessionID := r.URL.Query().Get("sessionId")
+	log.Printf("Checking sessionId (camelCase): '%s'", sessionID)
 	if sessionID == "" {
 		sessionID = r.URL.Query().Get("session_id")
+		log.Printf("Checking session_id (underscore): '%s'", sessionID)
 	}
 	if sessionID == "" {
 		sessionID = r.URL.Query().Get("sessionid") // 支持小写的 sessionid
+		log.Printf("Checking sessionid (lowercase): '%s'", sessionID)
 	}
+
+	// 调试：显示所有查询参数
+	log.Printf("All query parameters: %v", r.URL.Query())
 
 	if sessionID != "" {
 		log.Printf("Detected request to %s with sessionId: %s", r.URL.Path, sessionID)
+		log.Printf("Routing to handleSessionMessage for sessionId: %s", sessionID)
 		sm.handleSessionMessage(w, r, sessionID)
 		return
 	}
@@ -149,13 +335,47 @@ func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Re
 	var targetHandler http.Handler
 	var targetServerID string
 
-	// 尝试从 URL 路径中推断目标服务器
+	// 1. 尝试从 URL 路径中推断目标服务器
 	for i, serverID := range serverIDs {
 		if strings.Contains(r.URL.String(), serverID) {
 			targetHandler = handlers[i]
 			targetServerID = serverID
 			log.Printf("Inferred target server from URL: %s", serverID)
 			break
+		}
+	}
+
+	// 2. 尝试从 Referer 头推断目标服务器（如果请求来自特定的服务器页面）
+	if targetHandler == nil {
+		referer := r.Header.Get("Referer")
+		if referer != "" {
+			for i, serverID := range serverIDs {
+				if strings.Contains(referer, serverID) {
+					targetHandler = handlers[i]
+					targetServerID = serverID
+					log.Printf("Inferred target server from Referer: %s", serverID)
+					break
+				}
+			}
+		}
+	}
+
+	// 3. 对于缺少明确路由信息的请求，检查是否只有一个非 employee 服务器
+	if targetHandler == nil {
+		var nonEmployeeHandlers []http.Handler
+		var nonEmployeeServerIDs []string
+
+		for i, serverID := range serverIDs {
+			if serverID != "server_employee_info" {
+				nonEmployeeHandlers = append(nonEmployeeHandlers, handlers[i])
+				nonEmployeeServerIDs = append(nonEmployeeServerIDs, serverID)
+			}
+		}
+
+		if len(nonEmployeeHandlers) == 1 {
+			targetHandler = nonEmployeeHandlers[0]
+			targetServerID = nonEmployeeServerIDs[0]
+			log.Printf("Using the only non-employee server: %s", targetServerID)
 		}
 	}
 
@@ -190,13 +410,107 @@ func (sm *SessionManager) handleSessionMessage(w http.ResponseWriter, r *http.Re
 
 	if !exists {
 		log.Printf("Session not found: %s", sessionID)
-		http.Error(w, "Session not found", http.StatusNotFound)
-		return
+
+		// 尝试为 STDIO 服务按需创建会话，或者检查是否为本地内置服务
+		sm.handlerMutex.RLock()
+		for serverID := range sm.mcpHandlers {
+			// 检查是否为 STDIO 服务
+			isStdio, err := sm.manager.GetDB().IsRemoteStdioService(serverID)
+			if err == nil && isStdio {
+				log.Printf("Creating on-demand STDIO session for server: %s, sessionID: %s", serverID, sessionID)
+
+				// 释放读锁，获取写锁
+				sm.handlerMutex.RUnlock()
+				sm.handlerMutex.Lock()
+
+				// 创建虚拟会话信息
+				now := time.Now()
+				sm.sessions[sessionID] = &HTTPSessionInfo{
+					ServerID:     serverID,
+					SessionID:    sessionID,
+					Config:       nil, // STDIO 服务不需要 SSE 配置
+					LastUsed:     now,
+					CreatedAt:    now,
+					IsActive:     true,
+					ConnectionID: generateConnectionID(),
+				}
+
+				// 找到会话信息并使用处理器
+				sessionInfo = sm.sessions[sessionID]
+				exists = true
+
+				sm.handlerMutex.Unlock()
+
+				log.Printf("Created on-demand session for STDIO service: %s (sessionID: %s)", serverID, sessionID)
+				break
+			}
+
+			// 检查是否为本地内置服务（不是远程服务）
+			isSSE, sseErr := sm.manager.GetDB().IsRemoteSSEService(serverID)
+			if err == nil && sseErr == nil && !isStdio && !isSSE {
+				log.Printf("Creating virtual session for builtin service: %s, sessionID: %s", serverID, sessionID)
+
+				// 释放读锁，获取写锁
+				sm.handlerMutex.RUnlock()
+				sm.handlerMutex.Lock()
+
+				// 为本地内置服务创建虚拟会话
+				now := time.Now()
+				sm.sessions[sessionID] = &HTTPSessionInfo{
+					ServerID:     serverID,
+					SessionID:    sessionID,
+					Config:       nil, // 本地服务不需要 SSE 配置
+					LastUsed:     now,
+					CreatedAt:    now,
+					IsActive:     true,
+					ConnectionID: generateConnectionID(),
+				}
+
+				// 找到会话信息并使用处理器
+				sessionInfo = sm.sessions[sessionID]
+				exists = true
+
+				sm.handlerMutex.Unlock()
+
+				log.Printf("Created virtual session for builtin service: %s (sessionID: %s)", serverID, sessionID)
+				break
+			}
+		}
+		if !exists {
+			sm.handlerMutex.RUnlock()
+		}
+
+		if !exists {
+			http.Error(w, "Session not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	log.Printf("Found session for sessionId %s, forwarding to server: %s", sessionID, sessionInfo.ServerID)
 
-	// 构建远程 URL - 使用正确的端点格式
+	// 更新最后使用时间
+	sessionInfo.LastUsed = time.Now()
+
+	// 如果是 STDIO 服务（Config 为 nil），直接路由到对应的缓存处理器
+	if sessionInfo.Config == nil {
+		log.Printf("Routing STDIO session %s to server: %s", sessionID, sessionInfo.ServerID)
+
+		sm.handlerMutex.RLock()
+		handler, exists := sm.mcpHandlers[sessionInfo.ServerID]
+		sm.handlerMutex.RUnlock()
+
+		if !exists {
+			log.Printf("Handler not found for STDIO server: %s", sessionInfo.ServerID)
+			http.Error(w, "Server handler not available", http.StatusInternalServerError)
+			return
+		}
+
+		// 直接使用缓存的处理器
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	// 对于 SSE 服务，构建远程 URL - 使用正确的端点格式
 	remoteURL := sessionInfo.Config.BaseURL + "/messages/?session_id=" + sessionID
 
 	log.Printf("Forwarding message to: %s", remoteURL)
@@ -492,12 +806,16 @@ func (sm *SessionManager) handleRemoteSSEProxy(w http.ResponseWriter, r *http.Re
 				log.Printf("Extracted sessionId: %s for server: %s (endpoint: %s)", sessionID, serverID, endpointPath)
 
 				// 存储会话信息
+				now := time.Now()
 				sm.handlerMutex.Lock()
 				sm.sessions[sessionID] = &HTTPSessionInfo{
-					ServerID:  serverID,
-					SessionID: sessionID,
-					Config:    config,
-					LastUsed:  time.Now(),
+					ServerID:     serverID,
+					SessionID:    sessionID,
+					Config:       config,
+					LastUsed:     now,
+					CreatedAt:    now,
+					IsActive:     true,
+					ConnectionID: generateConnectionID(),
 				}
 				sm.handlerMutex.Unlock()
 			}

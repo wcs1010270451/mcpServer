@@ -15,6 +15,7 @@ type Config struct {
 	Logging  LoggingConfig  `yaml:"logging"`
 	Remote   RemoteConfig   `yaml:"remote"`
 	Tools    ToolsConfig    `yaml:"tools"`
+	Auth     AuthConfig     `yaml:"auth"`
 }
 
 // ServerConfig 服务器配置
@@ -58,6 +59,13 @@ type ToolsConfig struct {
 	BuiltinEcho   bool `yaml:"builtin_echo"`
 	BuiltinGreet  bool `yaml:"builtin_greet"`
 	BuiltinStatus bool `yaml:"builtin_status"`
+}
+
+// AuthConfig 认证配置
+type AuthConfig struct {
+	Enabled    bool     `yaml:"enabled"`
+	APIKeys    []string `yaml:"api_keys"`
+	HeaderName string   `yaml:"header_name"`
 }
 
 // GetDSN 获取数据库连接字符串

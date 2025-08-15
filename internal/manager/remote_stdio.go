@@ -17,11 +17,13 @@ import (
 
 // SessionInfo 会话信息
 type SessionInfo struct {
-	session     *mcp.ClientSession
-	client      *mcp.Client
-	lastUsed    time.Time
-	config      *models.MCPServiceStdio
-	activeConns int32 // 活跃连接数
+	session      *mcp.ClientSession
+	client       *mcp.Client
+	lastUsed     time.Time
+	config       *models.MCPServiceStdio
+	activeConns  int32            // 活跃连接数
+	userSessions map[string]int32 // 用户会话计数 (userID -> count)
+	sessionKeys  map[string]bool  // 会话键集合 (for per_session strategy)
 }
 
 // RemoteStdioManager 管理远程 stdio MCP 服务
@@ -48,15 +50,47 @@ func NewRemoteStdioManager(db DatabaseServiceInterface) *RemoteStdioManager {
 
 // GetOrCreateRemoteServer 获取或创建远程服务器连接
 func (rsm *RemoteStdioManager) GetOrCreateRemoteServer(serverID string) (*mcp.Server, error) {
+	return rsm.GetOrCreateRemoteServerWithContext(serverID, "", "")
+}
+
+// GetOrCreateRemoteServerWithContext 获取或创建远程服务器连接（带用户和会话上下文）
+func (rsm *RemoteStdioManager) GetOrCreateRemoteServerWithContext(serverID, userID, sessionKey string) (*mcp.Server, error) {
+	// 获取配置以确定复用策略
+	config, err := rsm.db.GetStdioServiceConfig(serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stdio config: %w", err)
+	}
+
+	// 根据复用策略生成实际的 session 键
+	actualSessionKey := rsm.generateSessionKey(serverID, userID, sessionKey, config.ReuseStrategy)
+
 	rsm.mutex.RLock()
-	if sessionInfo, exists := rsm.sessions[serverID]; exists {
+	if sessionInfo, exists := rsm.sessions[actualSessionKey]; exists {
+		// 检查是否超过最大并发数
+		if config.MaxConcurrent > 0 && atomic.LoadInt32(&sessionInfo.activeConns) >= int32(config.MaxConcurrent) {
+			rsm.mutex.RUnlock()
+			return nil, fmt.Errorf("service %s reached maximum concurrent connections (%d)", serverID, config.MaxConcurrent)
+		}
+
 		// 更新最后使用时间和连接数
 		sessionInfo.lastUsed = time.Now()
 		atomic.AddInt32(&sessionInfo.activeConns, 1)
+
+		// 更新用户会话计数
+		if userID != "" {
+			if sessionInfo.userSessions == nil {
+				sessionInfo.userSessions = make(map[string]int32)
+			}
+			sessionInfo.userSessions[userID]++
+		}
+
 		rsm.mutex.RUnlock()
 
+		log.Printf("Reusing existing session for %s (strategy: %s, active: %d/%d)",
+			serverID, config.ReuseStrategy, atomic.LoadInt32(&sessionInfo.activeConns), config.MaxConcurrent)
+
 		// 返回一个代理服务器，将请求转发到远程客户端
-		return rsm.createProxyServer(serverID, sessionInfo), nil
+		return rsm.createProxyServer(actualSessionKey, sessionInfo), nil
 	}
 	rsm.mutex.RUnlock()
 
@@ -65,17 +99,26 @@ func (rsm *RemoteStdioManager) GetOrCreateRemoteServer(serverID string) (*mcp.Se
 	defer rsm.mutex.Unlock()
 
 	// 双重检查
-	if sessionInfo, exists := rsm.sessions[serverID]; exists {
+	if sessionInfo, exists := rsm.sessions[actualSessionKey]; exists {
+		if config.MaxConcurrent > 0 && atomic.LoadInt32(&sessionInfo.activeConns) >= int32(config.MaxConcurrent) {
+			return nil, fmt.Errorf("service %s reached maximum concurrent connections (%d)", serverID, config.MaxConcurrent)
+		}
+
 		sessionInfo.lastUsed = time.Now()
 		atomic.AddInt32(&sessionInfo.activeConns, 1)
-		return rsm.createProxyServer(serverID, sessionInfo), nil
+
+		if userID != "" {
+			if sessionInfo.userSessions == nil {
+				sessionInfo.userSessions = make(map[string]int32)
+			}
+			sessionInfo.userSessions[userID]++
+		}
+
+		return rsm.createProxyServer(actualSessionKey, sessionInfo), nil
 	}
 
-	// 获取配置
-	config, err := rsm.db.GetStdioServiceConfig(serverID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get stdio config: %w", err)
-	}
+	log.Printf("Creating new session for %s (strategy: %s, max_concurrent: %d)",
+		serverID, config.ReuseStrategy, config.MaxConcurrent)
 
 	// 创建客户端连接
 	session, client, err := rsm.connectToRemoteService(config)
@@ -84,17 +127,44 @@ func (rsm *RemoteStdioManager) GetOrCreateRemoteServer(serverID string) (*mcp.Se
 	}
 
 	sessionInfo := &SessionInfo{
-		session:     session,
-		client:      client,
-		lastUsed:    time.Now(),
-		config:      config,
-		activeConns: 1,
+		session:      session,
+		client:       client,
+		lastUsed:     time.Now(),
+		config:       config,
+		activeConns:  1,
+		userSessions: make(map[string]int32),
+		sessionKeys:  make(map[string]bool),
 	}
 
-	rsm.sessions[serverID] = sessionInfo
+	// 初始化用户会话计数
+	if userID != "" {
+		sessionInfo.userSessions[userID] = 1
+	}
 
-	log.Printf("Successfully connected to remote stdio service: %s", serverID)
-	return rsm.createProxyServer(serverID, sessionInfo), nil
+	rsm.sessions[actualSessionKey] = sessionInfo
+
+	log.Printf("Successfully connected to remote stdio service: %s (session_key: %s)", serverID, actualSessionKey)
+	return rsm.createProxyServer(actualSessionKey, sessionInfo), nil
+}
+
+// generateSessionKey 根据复用策略生成会话键
+func (rsm *RemoteStdioManager) generateSessionKey(serverID, userID, sessionKey, reuseStrategy string) string {
+	switch reuseStrategy {
+	case "per_user":
+		if userID != "" {
+			return fmt.Sprintf("%s:user:%s", serverID, userID)
+		}
+		return fmt.Sprintf("%s:user:anonymous", serverID)
+	case "per_session":
+		if sessionKey != "" {
+			return fmt.Sprintf("%s:session:%s", serverID, sessionKey)
+		}
+		return fmt.Sprintf("%s:session:%d", serverID, time.Now().UnixNano())
+	case "shared":
+		fallthrough
+	default:
+		return serverID // 共享模式，所有用户使用相同的服务器ID作为键
+	}
 }
 
 // connectToRemoteService 连接到远程服务
@@ -289,4 +359,68 @@ func (rsm *RemoteStdioManager) CloseAll() {
 	}
 
 	rsm.sessions = make(map[string]*SessionInfo)
+}
+
+// GetSessionStats 获取会话统计信息
+func (rsm *RemoteStdioManager) GetSessionStats() map[string]interface{} {
+	rsm.mutex.RLock()
+	defer rsm.mutex.RUnlock()
+
+	stats := make(map[string]interface{})
+	totalSessions := 0
+	totalConnections := int32(0)
+	strategyStats := make(map[string]map[string]interface{})
+
+	for sessionKey, sessionInfo := range rsm.sessions {
+		totalSessions++
+		activeConns := atomic.LoadInt32(&sessionInfo.activeConns)
+		totalConnections += activeConns
+
+		strategy := sessionInfo.config.ReuseStrategy
+		if strategyStats[strategy] == nil {
+			strategyStats[strategy] = map[string]interface{}{
+				"sessions":    0,
+				"connections": int32(0),
+				"max_allowed": 0,
+				"services":    []string{},
+			}
+		}
+
+		strategyStats[strategy]["sessions"] = strategyStats[strategy]["sessions"].(int) + 1
+		strategyStats[strategy]["connections"] = strategyStats[strategy]["connections"].(int32) + activeConns
+		strategyStats[strategy]["max_allowed"] = sessionInfo.config.MaxConcurrent
+
+		services := strategyStats[strategy]["services"].([]string)
+		found := false
+		for _, service := range services {
+			if service == sessionInfo.config.ServerID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			services = append(services, sessionInfo.config.ServerID)
+			strategyStats[strategy]["services"] = services
+		}
+
+		// 详细会话信息
+		sessionDetail := map[string]interface{}{
+			"server_id":      sessionInfo.config.ServerID,
+			"strategy":       strategy,
+			"active_conns":   activeConns,
+			"max_concurrent": sessionInfo.config.MaxConcurrent,
+			"last_used":      sessionInfo.lastUsed,
+			"user_sessions":  len(sessionInfo.userSessions),
+		}
+		stats[sessionKey] = sessionDetail
+	}
+
+	summary := map[string]interface{}{
+		"total_sessions":    totalSessions,
+		"total_connections": totalConnections,
+		"by_strategy":       strategyStats,
+		"session_details":   stats,
+	}
+
+	return summary
 }

@@ -1,10 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"McpServer/internal/auth"
 	"McpServer/internal/config"
 	"McpServer/internal/database"
 	"McpServer/internal/handlers"
@@ -51,6 +56,9 @@ func main() {
 	// 创建会话管理器
 	sessionManager := manager.NewSessionManager(mcpManager, db)
 
+	// 创建认证中间件
+	authMiddleware := auth.NewAuthMiddleware(&cfg.Auth)
+
 	// 创建 HTTP 处理器
 	httpHandler := func(w http.ResponseWriter, r *http.Request) {
 		serverID := r.URL.Query().Get("server_id")
@@ -68,12 +76,55 @@ func main() {
 
 	// 设置路由
 	mux := http.NewServeMux()
-	mux.Handle("/mcp-server/sse", http.HandlerFunc(httpHandler))
-	mux.Handle("/messages/", http.HandlerFunc(httpHandler))
-	mux.Handle("/message", http.HandlerFunc(httpHandler))
+
+	// 为所有MCP相关端点添加认证
+	mux.Handle("/mcp-server/sse", authMiddleware.Middleware(httpHandler))
+	mux.Handle("/messages/", authMiddleware.Middleware(httpHandler))
+	mux.Handle("/message", authMiddleware.Middleware(httpHandler))
+
+	// 添加健康检查端点（不需要认证）
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	// 添加认证信息端点（不需要认证，用于调试）
+	mux.HandleFunc("/auth/info", func(w http.ResponseWriter, r *http.Request) {
+		if authMiddleware.IsEnabled() {
+			w.Write([]byte("Authentication: Enabled\nHeader: " + authMiddleware.GetHeaderName()))
+		} else {
+			w.Write([]byte("Authentication: Disabled"))
+		}
+	})
+
+	// 添加会话监控端点（需要认证）
+	mux.Handle("/admin/sessions", authMiddleware.Middleware(func(w http.ResponseWriter, r *http.Request) {
+		activeCount := sessionManager.GetActiveSessionCount()
+		sessionInfo := sessionManager.GetSessionInfo()
+
+		response := map[string]interface{}{
+			"active_sessions": activeCount,
+			"total_sessions":  len(sessionInfo),
+			"sessions":        sessionInfo,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	}))
 
 	addr := cfg.Server.GetServerAddr()
 	log.Printf("Server starting on %s", addr)
+
+	// 设置优雅关闭
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Printf("Received shutdown signal")
+		sessionManager.Shutdown()
+		os.Exit(0)
+	}()
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
