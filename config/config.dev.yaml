@@ -41,3 +41,10 @@ tools:
   builtin_echo: true
   builtin_greet: true
   builtin_status: true
+# 认证配置
+auth:
+  enabled: true
+  header_name: "X-API-Key"  # 可以自定义头名称
+  api_keys:
+    - "abcdefg"
+    - "hijklmn"

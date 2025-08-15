@@ -12,18 +12,20 @@ import (
 
 	"McpServer/internal/models"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // SessionInfo 会话信息
 type SessionInfo struct {
-	session      *mcp.ClientSession
-	client       *mcp.Client
-	lastUsed     time.Time
-	config       *models.MCPServiceStdio
-	activeConns  int32            // 活跃连接数
-	userSessions map[string]int32 // 用户会话计数 (userID -> count)
-	sessionKeys  map[string]bool  // 会话键集合 (for per_session strategy)
+	session         *mcp.ClientSession
+	client          *mcp.Client
+	lastUsed        time.Time
+	config          *models.MCPServiceStdio
+	activeConns     int32            // 活跃连接数
+	userSessions    map[string]int32 // 用户会话计数 (userID -> count)
+	sessionKeys     map[string]bool  // 会话键集合 (for per_session strategy)
+	keepAliveTicker *time.Ticker     // 保活定时器
 }
 
 // RemoteStdioManager 管理远程 stdio MCP 服务
@@ -136,6 +138,10 @@ func (rsm *RemoteStdioManager) GetOrCreateRemoteServerWithContext(serverID, user
 		sessionKeys:  make(map[string]bool),
 	}
 
+	// 启动保活机制 - 每2分钟发送一次心跳
+	sessionInfo.keepAliveTicker = time.NewTicker(2 * time.Minute)
+	go rsm.startKeepAlive(actualSessionKey, sessionInfo)
+
 	// 初始化用户会话计数
 	if userID != "" {
 		sessionInfo.userSessions[userID] = 1
@@ -227,14 +233,18 @@ func (rsm *RemoteStdioManager) createProxyServer(serverID string, sessionInfo *S
 
 	// 获取远程服务的工具列表
 	ctx := context.Background()
+	log.Printf("[INFO] Attempting to list tools from remote service: %s", serverID)
 	toolsResult, err := sessionInfo.session.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
-		log.Printf("Failed to list tools from remote service %s: %v", serverID, err)
+		log.Printf("[ERROR] Failed to list tools from remote service %s: %v", serverID, err)
 		return server
 	}
 
+	log.Printf("[INFO] Successfully got %d tools from remote service %s", len(toolsResult.Tools), serverID)
+
 	// 为每个远程工具创建代理工具
 	for _, tool := range toolsResult.Tools {
+		log.Printf("[INFO] Adding tool: %s - %s", tool.Name, tool.Description)
 		rsm.addProxyTool(server, sessionInfo, *tool)
 	}
 
@@ -249,21 +259,42 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 		atomic.AddInt32(&sessionInfo.activeConns, 1)
 		sessionInfo.lastUsed = time.Now()
 
+		// 记录工具调用开始
+		log.Printf("[INFO] === Tool Call Started ===")
+		log.Printf("[INFO] Tool: %s", params.Name)
+		log.Printf("[INFO] Arguments: %+v", params.Arguments)
+		log.Printf("[INFO] Server: %s", sessionInfo.config.ServerID)
+		log.Printf("[INFO] Active connections: %d", atomic.LoadInt32(&sessionInfo.activeConns))
+
 		// 转换参数类型
 		callParams := &mcp.CallToolParams{
 			Name:      params.Name,
 			Arguments: params.Arguments,
 		}
 
+		// 记录调用远程服务
+		log.Printf("[INFO] Calling remote tool: %s on server: %s", params.Name, sessionInfo.config.ServerID)
+
 		result, err := sessionInfo.session.CallTool(ctx, callParams)
 		if err != nil {
 			// 减少活跃连接数
 			atomic.AddInt32(&sessionInfo.activeConns, -1)
+			log.Printf("[ERROR] === Tool Call Failed ===")
+			log.Printf("[ERROR] Tool: %s", params.Name)
+			log.Printf("[ERROR] Error: %v", err)
+			log.Printf("[ERROR] ========================")
 			return nil, fmt.Errorf("remote call failed: %w", err)
 		}
 
 		// 减少活跃连接数
 		atomic.AddInt32(&sessionInfo.activeConns, -1)
+
+		// 记录工具调用成功
+		log.Printf("[INFO] === Tool Call Success ===")
+		log.Printf("[INFO] Tool: %s", params.Name)
+		log.Printf("[INFO] Result content count: %d items", len(result.Content))
+		log.Printf("[INFO] Is error: %t", result.IsError)
+		log.Printf("[INFO] ========================")
 
 		// 转换返回类型
 		return &mcp.CallToolResultFor[any]{
@@ -272,8 +303,28 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 		}, nil
 	}
 
-	mcp.AddTool(server, &tool, toolHandler)
-	log.Printf("Added proxy tool: %s", tool.Name)
+	// 创建兼容的工具副本，转换Schema版本
+	var convertedSchema *jsonschema.Schema
+	if tool.InputSchema != nil {
+		convertedSchema = rsm.convertSchemaToDraft2020(tool.InputSchema)
+	}
+
+	compatibleTool := mcp.Tool{
+		Name:        tool.Name,
+		Description: tool.Description,
+		InputSchema: convertedSchema,
+	}
+
+	// 尝试添加工具，如果失败则记录错误但不中断程序
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WARN] Failed to add proxy tool %s due to schema compatibility issue: %v", tool.Name, r)
+			log.Printf("[WARN] This tool will be skipped, but the service will continue to work")
+		}
+	}()
+
+	mcp.AddTool(server, &compatibleTool, toolHandler)
+	log.Printf("[INFO] Added proxy tool: %s", tool.Name)
 }
 
 // cleanupRoutine 清理协程，根据配置策略管理会话生命周期
@@ -308,7 +359,17 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 				idleDuration := now.Sub(sessionInfo.lastUsed)
 				ttl := time.Duration(sessionInfo.config.IdleTtlMs) * time.Millisecond
 				if idleDuration > ttl {
-					log.Printf("Closing idle session %s (idle for %v)", serverID, idleDuration)
+					log.Printf("[INFO] Closing idle session %s (idle for %v)", serverID, idleDuration)
+					toDelete = append(toDelete, serverID)
+				}
+			}
+		case "shared":
+			// 共享模式，只有在超过TTL且没有活跃连接时才关闭
+			if atomic.LoadInt32(&sessionInfo.activeConns) == 0 {
+				idleDuration := now.Sub(sessionInfo.lastUsed)
+				ttl := time.Duration(sessionInfo.config.IdleTtlMs) * time.Millisecond
+				if idleDuration > ttl {
+					log.Printf("[INFO] Closing idle shared session %s (idle for %v)", serverID, idleDuration)
 					toDelete = append(toDelete, serverID)
 				}
 			}
@@ -318,7 +379,7 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 		case "per_request":
 			// 每个请求独立，立即关闭（在工具调用完成后）
 			if atomic.LoadInt32(&sessionInfo.activeConns) == 0 {
-				log.Printf("Closing per-request session %s", serverID)
+				log.Printf("[INFO] Closing per-request session %s", serverID)
 				toDelete = append(toDelete, serverID)
 			}
 		}
@@ -327,6 +388,10 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 	// 清理标记的会话
 	for _, serverID := range toDelete {
 		if sessionInfo, exists := rsm.sessions[serverID]; exists {
+			// 停止保活定时器
+			if sessionInfo.keepAliveTicker != nil {
+				sessionInfo.keepAliveTicker.Stop()
+			}
 			sessionInfo.session.Close()
 			delete(rsm.sessions, serverID)
 		}
@@ -423,4 +488,58 @@ func (rsm *RemoteStdioManager) GetSessionStats() map[string]interface{} {
 	}
 
 	return summary
+}
+
+// convertSchemaToDraft2020 将JSON Schema从draft-07转换为draft/2020-12
+func (rsm *RemoteStdioManager) convertSchemaToDraft2020(originalSchema *jsonschema.Schema) *jsonschema.Schema {
+	if originalSchema == nil {
+		return nil
+	}
+
+	// 创建新的Schema对象
+	newSchema := &jsonschema.Schema{
+		Type:        originalSchema.Type,
+		Title:       originalSchema.Title,
+		Description: originalSchema.Description,
+		Properties:  make(map[string]*jsonschema.Schema),
+		Required:    originalSchema.Required,
+		Items:       originalSchema.Items,
+		Enum:        originalSchema.Enum,
+		Default:     originalSchema.Default,
+		Examples:    originalSchema.Examples,
+	}
+
+	// 递归处理Properties
+	if originalSchema.Properties != nil {
+		for propName, propSchema := range originalSchema.Properties {
+			newSchema.Properties[propName] = rsm.convertSchemaToDraft2020(propSchema)
+		}
+	}
+
+	// 递归处理Items
+	if originalSchema.Items != nil {
+		newSchema.Items = rsm.convertSchemaToDraft2020(originalSchema.Items)
+	}
+
+	return newSchema
+}
+
+// startKeepAlive 启动保活机制
+func (rsm *RemoteStdioManager) startKeepAlive(sessionKey string, sessionInfo *SessionInfo) {
+	for {
+		select {
+		case <-sessionInfo.keepAliveTicker.C:
+			// 发送心跳请求（列出工具来保持连接活跃）
+			ctx := context.Background()
+			_, err := sessionInfo.session.ListTools(ctx, &mcp.ListToolsParams{})
+			if err != nil {
+				log.Printf("[WARN] Keep-alive failed for session %s: %v", sessionKey, err)
+			} else {
+				sessionInfo.lastUsed = time.Now()
+				log.Printf("[DEBUG] Keep-alive successful for session %s", sessionKey)
+			}
+		case <-rsm.stopChan:
+			return
+		}
+	}
 }

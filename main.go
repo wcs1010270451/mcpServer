@@ -32,12 +32,16 @@ func main() {
 	// 从环境变量覆盖配置
 	config.LoadConfigFromEnv(cfg)
 
-	log.Printf("Starting MCP Server with config: %s:%d", cfg.Server.Host, cfg.Server.Port)
+	// 配置日志输出
+	log.SetOutput(os.Stdout) // 输出到stdout而不是stderr
+	log.SetFlags(0)          // 不添加时间戳，避免重复
+
+	log.Printf("[INFO] Starting MCP Server with config: %s:%d", cfg.Server.Host, cfg.Server.Port)
 
 	// 创建数据库服务
 	db, err := database.NewDatabaseService(&cfg.Database)
 	if err != nil {
-		log.Fatalf("Failed to create database service: %v", err)
+		log.Fatalf("[ERROR] Failed to create database service: %v", err)
 	}
 	defer db.Close()
 
@@ -50,7 +54,7 @@ func main() {
 
 	// 从数据库加载服务器配置
 	if err := mcpManager.LoadServersFromDatabase(); err != nil {
-		log.Fatalf("Failed to load servers from database: %v", err)
+		log.Fatalf("[ERROR] Failed to load servers from database: %v", err)
 	}
 
 	// 创建会话管理器
@@ -65,11 +69,11 @@ func main() {
 
 		if r.Method == "GET" && serverID != "" {
 			// 初始连接请求，带有 server_id
-			log.Printf("Handling initial connection with server_id: %s", serverID)
+			log.Printf("[INFO] Handling initial connection with server_id: %s", serverID)
 			sessionManager.HandleInitialConnection(w, r, serverID)
 		} else {
 			// 后续会话请求，基于 sessionId 路由
-			log.Printf("Handling session request, method: %s, URL: %s", r.Method, r.URL.Path)
+			log.Printf("[INFO] Handling session request, method: %s, URL: %s", r.Method, r.URL.Path)
 			sessionManager.HandleSessionRequest(w, r)
 		}
 	}
@@ -113,7 +117,7 @@ func main() {
 	}))
 
 	addr := cfg.Server.GetServerAddr()
-	log.Printf("Server starting on %s", addr)
+	log.Printf("[INFO] Server starting on %s", addr)
 
 	// 设置优雅关闭
 	sigChan := make(chan os.Signal, 1)
@@ -121,12 +125,12 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Printf("Received shutdown signal")
+		log.Printf("[INFO] Received shutdown signal")
 		sessionManager.Shutdown()
 		os.Exit(0)
 	}()
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		log.Fatalf("[ERROR] Server failed: %v", err)
 	}
 }
