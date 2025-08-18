@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"McpServer/internal/logger"
 	"context"
 	"fmt"
 	"log"
@@ -149,7 +150,7 @@ func (rsm *RemoteStdioManager) GetOrCreateRemoteServerWithContext(serverID, user
 
 	rsm.sessions[actualSessionKey] = sessionInfo
 
-	log.Printf("Successfully connected to remote stdio service: %s (session_key: %s)", serverID, actualSessionKey)
+	//log.Printf("Successfully connected to remote stdio service: %s (session_key: %s)", serverID, actualSessionKey)
 	return rsm.createProxyServer(actualSessionKey, sessionInfo), nil
 }
 
@@ -207,7 +208,7 @@ func (rsm *RemoteStdioManager) connectToRemoteService(config *models.MCPServiceS
 	// 创建传输
 	transport := mcp.NewCommandTransport(cmd)
 
-	log.Printf("Connecting to remote stdio service with command: %s %v", config.Command, config.Args)
+	logger.Info("Connecting to remote stdio service with command: %s %v", config.Command, config.Args)
 
 	// 创建超时上下文
 	timeout := time.Duration(config.StartupTimeoutMs) * time.Millisecond
@@ -233,18 +234,18 @@ func (rsm *RemoteStdioManager) createProxyServer(serverID string, sessionInfo *S
 
 	// 获取远程服务的工具列表
 	ctx := context.Background()
-	log.Printf("[INFO] Attempting to list tools from remote service: %s", serverID)
+	logger.Info("Attempting to list tools from remote service: %s", serverID)
 	toolsResult, err := sessionInfo.session.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
-		log.Printf("[ERROR] Failed to list tools from remote service %s: %v", serverID, err)
+		logger.Error("Failed to list tools from remote service %s: %v", serverID, err)
 		return server
 	}
 
-	log.Printf("[INFO] Successfully got %d tools from remote service %s", len(toolsResult.Tools), serverID)
+	logger.Info("Successfully got %d tools from remote service %s", len(toolsResult.Tools), serverID)
 
 	// 为每个远程工具创建代理工具
 	for _, tool := range toolsResult.Tools {
-		log.Printf("[INFO] Adding tool: %s - %s", tool.Name, tool.Description)
+		logger.Info("Adding tool: %s - %s", tool.Name, tool.Description)
 		rsm.addProxyTool(server, sessionInfo, *tool)
 	}
 
@@ -260,11 +261,11 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 		sessionInfo.lastUsed = time.Now()
 
 		// 记录工具调用开始
-		log.Printf("[INFO] === Tool Call Started ===")
-		log.Printf("[INFO] Tool: %s", params.Name)
-		log.Printf("[INFO] Arguments: %+v", params.Arguments)
-		log.Printf("[INFO] Server: %s", sessionInfo.config.ServerID)
-		log.Printf("[INFO] Active connections: %d", atomic.LoadInt32(&sessionInfo.activeConns))
+		logger.Debug("=== Tool Call Started ===")
+		logger.Debug("Tool: %s", params.Name)
+		logger.Debug("Arguments: %+v", params.Arguments)
+		logger.Debug("Server: %s", sessionInfo.config.ServerID)
+		logger.Debug("Active connections: %d", atomic.LoadInt32(&sessionInfo.activeConns))
 
 		// 转换参数类型
 		callParams := &mcp.CallToolParams{
@@ -273,16 +274,16 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 		}
 
 		// 记录调用远程服务
-		log.Printf("[INFO] Calling remote tool: %s on server: %s", params.Name, sessionInfo.config.ServerID)
+		logger.Info("Calling remote tool: %s on server: %s", params.Name, sessionInfo.config.ServerID)
 
 		result, err := sessionInfo.session.CallTool(ctx, callParams)
 		if err != nil {
 			// 减少活跃连接数
 			atomic.AddInt32(&sessionInfo.activeConns, -1)
-			log.Printf("[ERROR] === Tool Call Failed ===")
-			log.Printf("[ERROR] Tool: %s", params.Name)
-			log.Printf("[ERROR] Error: %v", err)
-			log.Printf("[ERROR] ========================")
+			logger.Error("=== Tool Call Failed ===")
+			logger.Error("Tool: %s", params.Name)
+			logger.Error("Error: %v", err)
+			logger.Error("===========================")
 			return nil, fmt.Errorf("remote call failed: %w", err)
 		}
 
@@ -290,12 +291,11 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 		atomic.AddInt32(&sessionInfo.activeConns, -1)
 
 		// 记录工具调用成功
-		log.Printf("[INFO] === Tool Call Success ===")
-		log.Printf("[INFO] Tool: %s", params.Name)
-		log.Printf("[INFO] Result content count: %d items", len(result.Content))
-		log.Printf("[INFO] Is error: %t", result.IsError)
-		log.Printf("[INFO] ========================")
-
+		logger.Debug("=== Tool Call Success ===")
+		logger.Debug("Tool: %s", params.Name)
+		logger.Debug("Result content count: %d items", len(result.Content))
+		logger.Debug("Is error: %t", result.IsError)
+		logger.Debug("===========================")
 		// 转换返回类型
 		return &mcp.CallToolResultFor[any]{
 			Content: result.Content,
@@ -318,13 +318,13 @@ func (rsm *RemoteStdioManager) addProxyTool(server *mcp.Server, sessionInfo *Ses
 	// 尝试添加工具，如果失败则记录错误但不中断程序
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[WARN] Failed to add proxy tool %s due to schema compatibility issue: %v", tool.Name, r)
-			log.Printf("[WARN] This tool will be skipped, but the service will continue to work")
+			logger.Warn("Failed to add proxy tool %s due to schema compatibility issue: %v", tool.Name, r)
+			logger.Warn("This tool will be skipped, but the service will continue to work")
 		}
 	}()
 
 	mcp.AddTool(server, &compatibleTool, toolHandler)
-	log.Printf("[INFO] Added proxy tool: %s", tool.Name)
+	logger.Info("Added proxy tool: %s", tool.Name)
 }
 
 // cleanupRoutine 清理协程，根据配置策略管理会话生命周期
@@ -359,7 +359,7 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 				idleDuration := now.Sub(sessionInfo.lastUsed)
 				ttl := time.Duration(sessionInfo.config.IdleTtlMs) * time.Millisecond
 				if idleDuration > ttl {
-					log.Printf("[INFO] Closing idle session %s (idle for %v)", serverID, idleDuration)
+					logger.Info("Closing idle session %s (idle for %v)", serverID, idleDuration)
 					toDelete = append(toDelete, serverID)
 				}
 			}
@@ -369,7 +369,7 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 				idleDuration := now.Sub(sessionInfo.lastUsed)
 				ttl := time.Duration(sessionInfo.config.IdleTtlMs) * time.Millisecond
 				if idleDuration > ttl {
-					log.Printf("[INFO] Closing idle shared session %s (idle for %v)", serverID, idleDuration)
+					logger.Info("Closing idle shared session %s (idle for %v)", serverID, idleDuration)
 					toDelete = append(toDelete, serverID)
 				}
 			}
@@ -379,7 +379,7 @@ func (rsm *RemoteStdioManager) cleanupIdleSessions() {
 		case "per_request":
 			// 每个请求独立，立即关闭（在工具调用完成后）
 			if atomic.LoadInt32(&sessionInfo.activeConns) == 0 {
-				log.Printf("[INFO] Closing per-request session %s", serverID)
+				logger.Info("Closing per-request session %s", serverID)
 				toDelete = append(toDelete, serverID)
 			}
 		}
@@ -406,7 +406,7 @@ func (rsm *RemoteStdioManager) CloseRemoteSession(serverID string) {
 	if sessionInfo, exists := rsm.sessions[serverID]; exists {
 		sessionInfo.session.Close()
 		delete(rsm.sessions, serverID)
-		log.Printf("Manually closed remote session: %s", serverID)
+		logger.Info("Manually closed remote session: %s", serverID)
 	}
 }
 
@@ -420,7 +420,7 @@ func (rsm *RemoteStdioManager) CloseAll() {
 
 	for serverID, sessionInfo := range rsm.sessions {
 		sessionInfo.session.Close()
-		log.Printf("Closed remote session: %s", serverID)
+		logger.Info("Closed remote session: %s", serverID)
 	}
 
 	rsm.sessions = make(map[string]*SessionInfo)
@@ -533,10 +533,10 @@ func (rsm *RemoteStdioManager) startKeepAlive(sessionKey string, sessionInfo *Se
 			ctx := context.Background()
 			_, err := sessionInfo.session.ListTools(ctx, &mcp.ListToolsParams{})
 			if err != nil {
-				log.Printf("[WARN] Keep-alive failed for session %s: %v", sessionKey, err)
+				logger.Error("Keep-alive failed for session %s: %v", sessionKey, err)
 			} else {
 				sessionInfo.lastUsed = time.Now()
-				log.Printf("[DEBUG] Keep-alive successful for session %s", sessionKey)
+				logger.Info("Keep-alive successful for session %s", sessionKey)
 			}
 		case <-rsm.stopChan:
 			return

@@ -1,7 +1,7 @@
 package auth
 
 import (
-	"log"
+	"McpServer/internal/logger"
 	"net/http"
 	"strings"
 
@@ -59,13 +59,12 @@ func (am *AuthMiddleware) Middleware(next http.HandlerFunc) http.HandlerFunc {
 
 		// 验证API密钥
 		if !am.ValidateAPIKey(apiKey) {
-			log.Printf("Authentication failed for request %s %s from %s",
-				r.Method, r.URL.Path, r.RemoteAddr)
+			logger.Info("Authentication failed for request %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 			http.Error(w, "Unauthorized: Invalid API Key", http.StatusUnauthorized)
 			return
 		}
 
-		log.Printf("Authentication successful for request %s %s", r.Method, r.URL.Path)
+		logger.Info("Authentication successful for request %s %s", r.Method, r.URL.Path)
 		next(w, r)
 	}
 }

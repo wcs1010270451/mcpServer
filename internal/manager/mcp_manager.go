@@ -1,11 +1,10 @@
 package manager
 
 import (
+	"McpServer/internal/logger"
+	"McpServer/internal/models"
 	"context"
 	"fmt"
-	"log"
-
-	"McpServer/internal/models"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -34,22 +33,22 @@ func NewMCPServerManager(db DatabaseServiceInterface, handlerRegistry HandlerReg
 func (m *MCPServerManager) LoadServersFromDatabase() error {
 	services, err := m.db.GetEnabledServices()
 	if err != nil {
-		return fmt.Errorf("failed to load services: %w", err)
+		return fmt.Errorf("failed to load builtin services: %w", err)
 	}
 
-	log.Printf("Loading %d services from database", len(services))
+	logger.Info("Loading %d builtin services from database", len(services))
 
 	for _, service := range services {
-		log.Printf("Loading service: %s", service.ServerID)
+		logger.Info("Loading builtin service: %s", service.ServerID)
 
-		server, err := m.createServerFromConfig(service)
-		if err != nil {
-			log.Printf("Warning: Failed to create server for service %s: %v", service.ServerID, err)
+		server, err1 := m.createServerFromConfig(service)
+		if err1 != nil {
+			logger.Info("Failed to create server for builtin service %s: %v", service.ServerID, err1)
 			continue
 		}
 
 		m.servers[service.ServerID] = server
-		log.Printf("Successfully loaded service: %s", service.ServerID)
+		logger.Info("Successfully loaded builtin service: %s", service.ServerID)
 	}
 
 	return nil
@@ -58,7 +57,7 @@ func (m *MCPServerManager) LoadServersFromDatabase() error {
 // createServerFromConfig 根据配置创建服务器
 func (m *MCPServerManager) createServerFromConfig(service models.MCPService) (*mcp.Server, error) {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "mcp-local-server",
+		Name:    "mcp-builtin-server",
 		Version: "1.0.0",
 	}, nil)
 
@@ -70,12 +69,12 @@ func (m *MCPServerManager) createServerFromConfig(service models.MCPService) (*m
 
 	// 添加工具
 	for _, tool := range tools {
-		log.Printf("Adding tool: %s to server: %s", tool.Name, service.ServerID)
+		logger.Info("Adding tool: %s to server: %s", tool.Name, service.ServerID)
 
 		// 获取处理器
 		handler, exists := m.handlerRegistry.GetHandler(tool.HandlerType)
 		if !exists {
-			log.Printf("Warning: No handler found for type: %s", tool.HandlerType)
+			logger.Warn("No handler found for type: %s", tool.HandlerType)
 			continue
 		}
 
@@ -87,9 +86,9 @@ func (m *MCPServerManager) createServerFromConfig(service models.MCPService) (*m
 
 		// 转换 JSONB 到 JSON Schema
 		if tool.ArgsSchema != nil {
-			schema, err := tool.ArgsSchema.ToJSONSchema()
-			if err != nil {
-				log.Printf("Warning: Failed to convert args schema for tool %s: %v", tool.Name, err)
+			schema, err1 := tool.ArgsSchema.ToJSONSchema()
+			if err1 != nil {
+				logger.Warn("Failed to convert args schema for tool %s: %v", tool.Name, err1)
 			} else if schema != nil {
 				toolDef.InputSchema = schema
 			}
@@ -102,9 +101,9 @@ func (m *MCPServerManager) createServerFromConfig(service models.MCPService) (*m
 				Name:      params.Name,
 				Arguments: params.Arguments,
 			}
-			result, err := handler(ctx, session, callParams)
-			if err != nil {
-				return nil, err
+			result, err1 := handler(ctx, session, callParams)
+			if err1 != nil {
+				return nil, err1
 			}
 			// 转换返回类型
 			return &mcp.CallToolResultFor[any]{
@@ -127,7 +126,7 @@ func (m *MCPServerManager) GetServer(serverID string) (*mcp.Server, error) {
 		return nil, fmt.Errorf("failed to check if service is remote stdio: %w", err)
 	}
 	if isRemoteStdio {
-		log.Printf("Getting remote stdio server for: %s", serverID)
+		logger.Info("Getting remote stdio server for: %s", serverID)
 		return m.remoteManager.GetOrCreateRemoteServer(serverID)
 	}
 
@@ -137,13 +136,13 @@ func (m *MCPServerManager) GetServer(serverID string) (*mcp.Server, error) {
 		return nil, fmt.Errorf("failed to check if service is remote SSE: %w", err)
 	}
 	if isRemoteSSE {
-		log.Printf("Getting remote SSE server for: %s", serverID)
+		logger.Info("Getting remote SSE server for: %s", serverID)
 		return m.sseManager.GetOrCreateRemoteServer(serverID)
 	}
 
 	// 本地服务
 	if server, exists := m.servers[serverID]; exists {
-		log.Printf("Using local MCP server for: %s", serverID)
+		logger.Info("Using builtin MCP server for: %s", serverID)
 		return server, nil
 	}
 

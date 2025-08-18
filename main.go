@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +12,7 @@ import (
 	"McpServer/internal/config"
 	"McpServer/internal/database"
 	"McpServer/internal/handlers"
+	"McpServer/internal/logger"
 	"McpServer/internal/manager"
 )
 
@@ -26,22 +26,22 @@ func main() {
 	// 加载配置
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatal("Failed to load config: %v", err)
 	}
 
 	// 从环境变量覆盖配置
 	config.LoadConfigFromEnv(cfg)
 
-	// 配置日志输出
-	log.SetOutput(os.Stdout) // 输出到stdout而不是stderr
-	log.SetFlags(0)          // 不添加时间戳，避免重复
+	// 配置日志级别
+	logger.SetLevelFromString(cfg.Logging.Level)
 
-	log.Printf("[INFO] Starting MCP Server with config: %s:%d", cfg.Server.Host, cfg.Server.Port)
+	logger.Info("Starting MCP Server with config: %s:%d", cfg.Server.Host, cfg.Server.Port)
 
 	// 创建数据库服务
 	db, err := database.NewDatabaseService(&cfg.Database)
 	if err != nil {
-		log.Fatalf("[ERROR] Failed to create database service: %v", err)
+		logger.Fatal("Failed to create database service: %v", err)
+		return
 	}
 	defer db.Close()
 
@@ -52,9 +52,9 @@ func main() {
 	// 创建 MCP 服务器管理器
 	mcpManager := manager.NewMCPServerManager(db, handlerRegistry)
 
-	// 从数据库加载服务器配置
-	if err := mcpManager.LoadServersFromDatabase(); err != nil {
-		log.Fatalf("[ERROR] Failed to load servers from database: %v", err)
+	// 从数据库加载内置服务器配置
+	if err = mcpManager.LoadServersFromDatabase(); err != nil {
+		logger.Fatal("Failed to load builtin servers from database", err)
 	}
 
 	// 创建会话管理器
@@ -69,11 +69,11 @@ func main() {
 
 		if r.Method == "GET" && serverID != "" {
 			// 初始连接请求，带有 server_id
-			log.Printf("[INFO] Handling initial connection with server_id: %s", serverID)
+			logger.Info("Handling initial connection with server_id: %s", serverID)
 			sessionManager.HandleInitialConnection(w, r, serverID)
 		} else {
 			// 后续会话请求，基于 sessionId 路由
-			log.Printf("[INFO] Handling session request, method: %s, URL: %s", r.Method, r.URL.Path)
+			logger.Info("Handling session request, method: %s, URL: %s", r.Method, r.URL.Path)
 			sessionManager.HandleSessionRequest(w, r)
 		}
 	}
@@ -117,7 +117,7 @@ func main() {
 	}))
 
 	addr := cfg.Server.GetServerAddr()
-	log.Printf("[INFO] Server starting on %s", addr)
+	logger.Info("Server starting on %s", addr)
 
 	// 设置优雅关闭
 	sigChan := make(chan os.Signal, 1)
@@ -125,12 +125,12 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Printf("[INFO] Received shutdown signal")
+		logger.Info("Received shutdown signal")
 		sessionManager.Shutdown()
 		os.Exit(0)
 	}()
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("[ERROR] Server failed: %v", err)
+	if err = http.ListenAndServe(addr, mux); err != nil {
+		logger.Error("Server failed: %v", err)
 	}
 }

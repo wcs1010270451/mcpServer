@@ -1,9 +1,9 @@
 package database
 
 import (
+	"McpServer/internal/logger"
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -43,12 +43,11 @@ func NewDatabaseService(config DatabaseConfig) (*DatabaseService, error) {
 	db.SetConnMaxLifetime(config.GetConnMaxLifetime())
 
 	// 测试连接
-	if err := db.Ping(); err != nil {
+	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	log.Printf("Successfully connected to database")
-
+	logger.Info("Successfully connected to database")
 	return &DatabaseService{db: db}, nil
 }
 
@@ -76,7 +75,7 @@ func (ds *DatabaseService) GetEnabledServices() ([]models.MCPService, error) {
 	var services []models.MCPService
 	for rows.Next() {
 		var service models.MCPService
-		err := rows.Scan(
+		err = rows.Scan(
 			&service.ServerID,
 			&service.DisplayName,
 			&service.ImplementationName,
@@ -149,7 +148,7 @@ func (ds *DatabaseService) GetToolsByServerID(serverID string) ([]models.MCPTool
 	var tools []models.MCPTool
 	for rows.Next() {
 		var tool models.MCPTool
-		err := rows.Scan(
+		err = rows.Scan(
 			&tool.ID,
 			&tool.ServerID,
 			&tool.Name,

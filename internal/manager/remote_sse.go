@@ -1,9 +1,9 @@
 package manager
 
 import (
+	"McpServer/internal/logger"
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -88,7 +88,7 @@ func (rsm *RemoteSSEManager) GetOrCreateRemoteServer(serverID string) (*mcp.Serv
 		return nil, fmt.Errorf("failed to connect to remote SSE service: %w", err)
 	}
 
-	log.Printf("Successfully connected to remote SSE service: %s", serverID)
+	logger.Info("Successfully connected to remote SSE service: %s", serverID)
 
 	// 存储会话信息
 	sessionInfo := &SSESessionInfo{
@@ -107,7 +107,7 @@ func (rsm *RemoteSSEManager) GetOrCreateRemoteServer(serverID string) (*mcp.Serv
 func (rsm *RemoteSSEManager) connectToRemoteSSEService(config *models.MCPServiceSSE) (*mcp.ClientSession, *mcp.Client, error) {
 	// 构建完整的 URL
 	fullURL := config.BaseURL + config.SSEPath
-	log.Printf("Connecting to remote SSE service: %s", fullURL)
+	logger.Info("Connecting to remote SSE service: %s", fullURL)
 
 	// 创建HTTP客户端，添加自定义头部
 	var headers map[string]string
@@ -164,8 +164,8 @@ func (rsm *RemoteSSEManager) createProxyServer(serverID string, sessionInfo *SSE
 	// 尝试获取远程服务器的工具列表
 	toolsResult, err := sessionInfo.session.ListTools(context.Background(), &mcp.ListToolsParams{})
 	if err != nil {
-		log.Printf("Failed to list tools from remote SSE service %s: %v", serverID, err)
-		log.Printf("Returning basic proxy server for %s without pre-loaded tools", serverID)
+		logger.Error("Failed to list tools from remote SSE service %s: %v", serverID, err)
+		logger.Error("Returning basic proxy server for %s without pre-loaded tools", serverID)
 		return server
 	}
 
@@ -212,7 +212,7 @@ func (rsm *RemoteSSEManager) CleanupIdleSessions(idleTimeout time.Duration) {
 	for serverID, sessionInfo := range rsm.sessions {
 		if atomic.LoadInt32(&sessionInfo.activeConns) == 0 &&
 			now.Sub(sessionInfo.lastUsed) > idleTimeout {
-			log.Printf("Cleaning up idle SSE session for server: %s", serverID)
+			logger.Info("Cleaning up idle SSE session for server: %s", serverID)
 
 			// 关闭会话
 			if sessionInfo.session != nil {
