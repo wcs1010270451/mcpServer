@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"McpServer/internal/auth"
@@ -65,7 +66,14 @@ func main() {
 
 	// 创建 HTTP 处理器
 	httpHandler := func(w http.ResponseWriter, r *http.Request) {
-		serverID := r.URL.Query().Get("server_id")
+		// 从路径中提取 server_id，格式为 /mcp-server/{server_id}/sse
+		pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		var serverID string
+
+		// 检查路径格式：/mcp-server/{server_id}/sse
+		if len(pathParts) >= 3 && pathParts[0] == "mcp-server" && pathParts[2] == "sse" {
+			serverID = pathParts[1]
+		}
 
 		if r.Method == "GET" && serverID != "" {
 			// 初始连接请求，带有 server_id
@@ -82,7 +90,8 @@ func main() {
 	mux := http.NewServeMux()
 
 	// 为所有MCP相关端点添加认证
-	mux.Handle("/mcp-server/sse", authMiddleware.Middleware(httpHandler))
+	// 修改路由格式：/mcp-server/{server_id}/sse
+	mux.Handle("/mcp-server/", authMiddleware.Middleware(httpHandler))
 	mux.Handle("/messages/", authMiddleware.Middleware(httpHandler))
 	mux.Handle("/message", authMiddleware.Middleware(httpHandler))
 

@@ -70,3 +70,4 @@ WHERE s.server_id = 'bing-cn-mcp-server';
 
 -- 如果需要删除（测试用）
 -- DELETE FROM mcp_service WHERE server_id = 'bing-cn-mcp-server';
+

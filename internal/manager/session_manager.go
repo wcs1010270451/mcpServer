@@ -211,7 +211,6 @@ func (sm *SessionManager) HandleInitialConnection(w http.ResponseWriter, r *http
 	logger.Info("Creating new MCP SSE handler for server: %s", serverID)
 	mcpHandler := mcp.NewSSEHandler(func(request *http.Request) *mcp.Server {
 		logger.Info("MCP SSE Handler called for server %s, method: %s, URL: %s", serverID, request.Method, request.URL.String())
-		// 这里不在 GET 请求时创建 STDIO 会话，而是在后续的 POST 请求中按需创建
 		return server
 	})
 
@@ -313,7 +312,7 @@ func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	// 调试：显示所有查询参数
-	log.Printf("All query parameters: %v", r.URL.Query())
+	//log.Printf("All query parameters: %v", r.URL.Query())
 	logger.Debug("All query parameters: %v", r.URL.Query())
 
 	if sessionID != "" {
@@ -345,10 +344,9 @@ func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 如果只有一个活跃的处理器，仍然需要验证session（如果提供了sessionID）
+	// 如果只有一个活跃的处理器，检查是否有sessionID参数
 	if len(handlers) == 1 {
-		// 检查是否有明确的sessionID参数，如果有则需要验证
-		sessionID = r.URL.Query().Get("sessionId")
+		sessionID := r.URL.Query().Get("sessionId")
 		if sessionID == "" {
 			sessionID = r.URL.Query().Get("session_id")
 		}
@@ -357,15 +355,16 @@ func (sm *SessionManager) HandleSessionRequest(w http.ResponseWriter, r *http.Re
 		}
 
 		if sessionID != "" {
-			// 有sessionID的请求必须通过正常的session验证流程
-			logger.Info("Request with sessionID %s, routing to session validation", sessionID)
+			// 有sessionID的请求需要路由到正确的session
+			logger.Info("Single handler with sessionID %s, routing through session management", sessionID)
 			sm.handleSessionMessage(w, r, sessionID)
 			return
+		} else {
+			// 没有sessionID的请求直接转发（例如初始连接后的第一个请求）
+			logger.Info("Single handler without sessionID, direct forwarding to: %s", serverIDs[0])
+			handlers[0].ServeHTTP(w, r)
+			return
 		}
-
-		logger.Info("Using single cached handler for session request without sessionID: %s", serverIDs[0])
-		handlers[0].ServeHTTP(w, r)
-		return
 	}
 
 	// 如果有多个处理器，尝试从 URL 路径或其他信息推断目标服务器
@@ -461,12 +460,63 @@ func (sm *SessionManager) handleSessionMessage(w http.ResponseWriter, r *http.Re
 
 	// 添加调试信息
 	logger.Debug("Looking up sessionId: %s", sessionID)
-	logger.Debug("Available sessions: %d", len(sm.sessions))
 
 	if !exists {
-		// POST请求不应该创建新session，session应该在GET连接时已经建立
-		logger.Error("Session not found: %s. Sessions must be established through initial GET connection, not POST requests.", sessionID)
-		http.Error(w, "Session not found. Please establish connection first.", http.StatusNotFound)
+		// 对于内置服务，允许按需创建session，但要严格验证
+		logger.Info("Session not found: %s, checking if can create for builtin service", sessionID)
+
+		sm.handlerMutex.RLock()
+		activeHandlers := make(map[string]bool)
+		for serverID := range sm.mcpHandlers {
+			activeHandlers[serverID] = true
+		}
+		sm.handlerMutex.RUnlock()
+
+		// 只有当有活跃handler且是内置服务时才允许按需创建
+		for serverID := range activeHandlers {
+			// 检查是否为内置服务（既不是STDIO也不是SSE的远程服务）
+			isStdio, stdioErr := sm.manager.GetDB().IsRemoteStdioService(serverID)
+			isSSE, sseErr := sm.manager.GetDB().IsRemoteSSEService(serverID)
+
+			if stdioErr == nil && sseErr == nil && !isStdio && !isSSE {
+				logger.Info("Creating virtual session for builtin service: %s, sessionID: %s", serverID, sessionID)
+
+				// 创建虚拟会话
+				now := time.Now()
+				sm.handlerMutex.Lock()
+				sm.sessions[sessionID] = &HTTPSessionInfo{
+					ServerID:     serverID,
+					SessionID:    sessionID,
+					Config:       nil, // 内置服务不需要 SSE 配置
+					LastUsed:     now,
+					CreatedAt:    now,
+					IsActive:     true,
+					ConnectionID: generateConnectionID(),
+				}
+				sm.handlerMutex.Unlock()
+
+				logger.Info("Successfully created virtual session for builtin service: %s (sessionID: %s)", serverID, sessionID)
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			// 对于远程服务或其他情况，拒绝创建session
+			logger.Error("Session not found and cannot create: %s (not a builtin service or multiple handlers)", sessionID)
+			http.Error(w, "Session not found. Please establish connection first.", http.StatusNotFound)
+			return
+		}
+	}
+
+	// 重新获取session信息，因为前面可能已经释放了锁
+	sm.handlerMutex.RLock()
+	sessionInfo, exists = sm.sessions[sessionID]
+	sm.handlerMutex.RUnlock()
+
+	if !exists {
+		logger.Error("Session disappeared during processing: %s", sessionID)
+		http.Error(w, "Session not available", http.StatusNotFound)
 		return
 	}
 

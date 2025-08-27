@@ -70,6 +70,7 @@ func (ds *DatabaseService) GetEnabledServices() ([]models.MCPService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to query services: %w", err)
 	}
+	logger.Debug("%s", query)
 	defer rows.Close()
 
 	var services []models.MCPService
@@ -125,7 +126,7 @@ func (ds *DatabaseService) GetServiceByID(serverID string) (*models.MCPService, 
 		}
 		return nil, fmt.Errorf("failed to get service: %w", err)
 	}
-
+	logger.Debug("%s", query)
 	return &service, nil
 }
 
@@ -143,6 +144,7 @@ func (ds *DatabaseService) GetToolsByServerID(serverID string) ([]models.MCPTool
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tools: %w", err)
 	}
+	logger.Debug("%s", query)
 	defer rows.Close()
 
 	var tools []models.MCPTool
@@ -218,7 +220,7 @@ func (ds *DatabaseService) GetStdioServiceConfig(serverID string) (*models.MCPSe
 		}
 		return nil, fmt.Errorf("failed to get stdio config: %w", err)
 	}
-
+	logger.Debug("%s", query)
 	config.Args = args
 	return &config, nil
 }
@@ -266,7 +268,7 @@ func (ds *DatabaseService) GetSSEServiceConfig(serverID string) (*models.MCPServ
 		}
 		return nil, fmt.Errorf("failed to get sse config: %w", err)
 	}
-
+	logger.Debug("%s", query)
 	return &config, nil
 }
 
@@ -284,7 +286,7 @@ func (ds *DatabaseService) IsRemoteStdioService(serverID string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("failed to check remote stdio service: %w", err)
 	}
-
+	logger.Debug("%s", query)
 	return exists, nil
 }
 
@@ -302,7 +304,7 @@ func (ds *DatabaseService) IsRemoteSSEService(serverID string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("failed to check remote sse service: %w", err)
 	}
-
+	logger.Debug("%s", query)
 	return exists, nil
 }
 
@@ -329,7 +331,7 @@ func (ds *DatabaseService) GetEmployeeByName(name string) (*models.Employee, err
 		}
 		return nil, fmt.Errorf("failed to query employee by name: %v", err)
 	}
-
+	logger.Debug("%s", query)
 	return &employee, nil
 }
 
@@ -346,12 +348,13 @@ func (ds *DatabaseService) GetAllEmployees() ([]models.Employee, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to query employees: %v", err)
 	}
+	logger.Debug("%s", query)
 	defer rows.Close()
 
 	var employees []models.Employee
 	for rows.Next() {
 		var employee models.Employee
-		err := rows.Scan(
+		err = rows.Scan(
 			&employee.ID,
 			&employee.Name,
 			&employee.Address,
